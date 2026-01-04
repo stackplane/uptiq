@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sitelert/internal/config"
+	"sitelert/internal/metrics"
 	"sitelert/internal/scheduler"
 	"sitelert/internal/server"
 	"syscall"
@@ -48,9 +49,12 @@ func Execute() {
 				bind = opts.listen
 			}
 
-			srv := server.NewServer(bind, logger)
+			bundle := metrics.NewBundle()
+			bundle.Metrics.InitServices(cfg.Services)
 
-			sched, err := scheduler.NewScheduler(*cfg, logger)
+			srv := server.NewServer(bind, logger, bundle.Registry)
+
+			sched, err := scheduler.NewScheduler(*cfg, logger, bundle.Metrics)
 			if err != nil {
 				return err
 			}

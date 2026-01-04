@@ -19,9 +19,12 @@ type Server struct {
 	log        *slog.Logger
 }
 
-func NewServer(addr string, log *slog.Logger) *Server {
+func NewServer(addr string, log *slog.Logger, reg *prometheus.Registry) *Server {
 	if log == nil {
 		log = slog.Default()
+	}
+	if reg == nil {
+		reg = prometheus.NewRegistry()
 	}
 
 	mux := http.NewServeMux()
@@ -31,7 +34,6 @@ func NewServer(addr string, log *slog.Logger) *Server {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	reg := prometheus.NewRegistry()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 
 	s := &http.Server{

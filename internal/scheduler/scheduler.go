@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"sitelert/internal/checks"
 	"sitelert/internal/config"
+	"sitelert/internal/metrics"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ type Scheduler struct {
 	jitter      time.Duration
 
 	httpChecker *checks.HTTPChecker
+	metrics     *metrics.Metrics
 
 	jobsCh chan job
 	wg     sync.WaitGroup
@@ -54,7 +56,7 @@ func (h scheduleHeap) Peek() *scheduledItem {
 	return h[0]
 }
 
-func NewScheduler(cfg config.SitelertConfig, log *slog.Logger) (*Scheduler, error) {
+func NewScheduler(cfg config.SitelertConfig, log *slog.Logger, m *metrics.Metrics) (*Scheduler, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -74,6 +76,7 @@ func NewScheduler(cfg config.SitelertConfig, log *slog.Logger) (*Scheduler, erro
 		workerCount: workerCount,
 		jitter:      j,
 		httpChecker: checks.NewHTTPChecker(),
+		metrics:     m,
 		jobsCh:      make(chan job, workerCount*4),
 	}, nil
 }
@@ -88,7 +91,7 @@ func (s *Scheduler) Start(ctx context.Context, services []config.Service) error 
 	for _, svc := range services {
 		typ := strings.ToLower(strings.TrimSpace(svc.Type))
 		if typ != "http" {
-			s.log.Warn("skipping unsupoorted service type",
+			s.log.Warn("skipping unsupported service type",
 				"service_id", svc.ID,
 				"service_name", svc.Name,
 				"type", svc.Type,
@@ -201,6 +204,10 @@ func (s *Scheduler) runJob(parent context.Context, workerID int, jb job) {
 
 	start := time.Now()
 	res := s.httpChecker.Check(ctx, svc)
+
+	if s.metrics != nil {
+		s.metrics.Observe(svc, res)
+	}
 
 	fields := []any{
 		"worker", workerID,
