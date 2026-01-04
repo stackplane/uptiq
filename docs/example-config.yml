@@ -15,6 +15,15 @@ services:
     timeout: "5s"
     expected_status: [200, 301, 302]
 
+  - id: "api"
+    name: "API Endpoint"
+    type: "http"
+    url: "https://api.example.com/health"
+    interval: "1m"
+    timeout: "3s"
+    expected_status: [200]
+    expected_body_regex: "healthy"
+
   - id: "ssh"
     name: "Home Server SSH"
     type: "tcp"

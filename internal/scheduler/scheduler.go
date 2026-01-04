@@ -7,12 +7,14 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
-	"sitelert/internal/checks"
-	"sitelert/internal/config"
-	"sitelert/internal/metrics"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"sitelert/internal/checks"
+	"sitelert/internal/config"
+	"sitelert/internal/metrics"
 )
 
 type ResultHandler interface {
@@ -30,8 +32,10 @@ type Scheduler struct {
 	metrics *metrics.Metrics
 	handler ResultHandler
 
-	jobsCh chan job
-	wg     sync.WaitGroup
+	jobsCh   chan job
+	updateCh chan []config.Service
+
+	wg sync.WaitGroup
 }
 
 type job struct {
@@ -54,7 +58,7 @@ func (h *scheduleHeap) Pop() any {
 	old := *h
 	n := len(old)
 	item := old[n-1]
-	*h = old[0 : n-1]
+	*h = old[:n-1]
 	return item
 }
 func (h scheduleHeap) Peek() *scheduledItem {
@@ -64,7 +68,7 @@ func (h scheduleHeap) Peek() *scheduledItem {
 	return h[0]
 }
 
-func NewScheduler(cfg config.SitelertConfig, log *slog.Logger, m *metrics.Metrics, handler ResultHandler) (*Scheduler, error) {
+func New(cfg *config.SitelertConfig, log *slog.Logger, m *metrics.Metrics, handler ResultHandler) (*Scheduler, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -88,13 +92,122 @@ func NewScheduler(cfg config.SitelertConfig, log *slog.Logger, m *metrics.Metric
 		metrics:     m,
 		handler:     handler,
 		jobsCh:      make(chan job, workerCount*4),
+		updateCh:    make(chan []config.Service, 1),
 	}, nil
+}
+
+// UpdateServices triggers a schedule rebuild. It does not stop workers.
+func (s *Scheduler) UpdateServices(services []config.Service) {
+	// Keep only the latest update
+	select {
+	case s.updateCh <- services:
+		return
+	default:
+		select {
+		case <-s.updateCh:
+		default:
+		}
+		s.updateCh <- services
+	}
 }
 
 func (s *Scheduler) Start(ctx context.Context, services []config.Service) error {
 	s.startWorkers(ctx)
 
 	h := &scheduleHeap{}
+	heap.Init(h)
+	s.rebuildHeap(h, services)
+
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	for {
+		next := h.Peek()
+		var wait time.Duration
+		if next == nil {
+			wait = 500 * time.Millisecond
+		} else {
+			now := time.Now()
+			if next.nextRun.After(now) {
+				wait = next.nextRun.Sub(now)
+			} else {
+				wait = 0
+			}
+		}
+
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
+
+		select {
+		case <-ctx.Done():
+			s.log.Info("scheduler stopping", "reason", ctx.Err())
+			s.stopWorkers()
+			return nil
+
+		case newServices := <-s.updateCh:
+			// Rebuild schedule immediately on reload
+			s.rebuildHeap(h, newServices)
+
+		case <-timer.C:
+			item := h.Peek()
+			if item == nil {
+				continue
+			}
+			if item.nextRun.After(time.Now()) {
+				continue
+			}
+
+			// Due
+			item = heap.Pop(h).(*scheduledItem)
+			select {
+			case <-ctx.Done():
+				s.stopWorkers()
+				return nil
+			case s.jobsCh <- job{svc: item.svc}:
+			}
+
+			interval, err := time.ParseDuration(item.svc.Interval)
+			if err != nil || interval <= 0 {
+				interval = 30 * time.Second
+			}
+			item.nextRun = time.Now().Add(interval).Add(s.randJitter())
+			heap.Push(h, item)
+		}
+	}
+}
+
+func (s *Scheduler) rebuildHeap(h *scheduleHeap, services []config.Service) {
+	// Diff logging: added/removed/changed (best-effort)
+	prev := make(map[string]config.Service)
+	for _, it := range *h {
+		prev[it.svc.ID] = it.svc
+	}
+	next := make(map[string]config.Service)
+	for _, svc := range services {
+		next[svc.ID] = svc
+	}
+
+	var added, removed, changed []string
+	for id, svc := range next {
+		if old, ok := prev[id]; !ok {
+			added = append(added, id)
+		} else if !servicesEqualForSchedule(old, svc) {
+			changed = append(changed, id)
+		}
+	}
+	for id := range prev {
+		if _, ok := next[id]; !ok {
+			removed = append(removed, id)
+		}
+	}
+
+	// Clear heap and rebuild
+	*h = (*h)[:0]
 	heap.Init(h)
 
 	now := time.Now()
@@ -110,11 +223,11 @@ func (s *Scheduler) Start(ctx context.Context, services []config.Service) error 
 		}
 
 		interval, err := time.ParseDuration(svc.Interval)
-		if err != nil {
-			return fmt.Errorf("parse interval for service %q: %w", svc.ID, err)
-		}
-		if interval <= 0 {
-			return fmt.Errorf("service %q interval must be > 0", svc.ID)
+		if err != nil || interval <= 0 {
+			s.log.Warn("invalid interval; using fallback",
+				"service_id", svc.ID,
+				"interval", svc.Interval,
+			)
 		}
 
 		first := now.Add(s.randJitter())
@@ -129,51 +242,53 @@ func (s *Scheduler) Start(ctx context.Context, services []config.Service) error 
 		)
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			s.log.Info("schedule stopping", "reason", ctx.Err())
-			s.stopWorkers()
-			return nil
-		default:
-		}
-
-		next := h.Peek()
-		if next == nil {
-			select {
-			case <-ctx.Done():
-				s.stopWorkers()
-				return nil
-			case <-time.After(500 * time.Millisecond):
-				continue
-			}
-		}
-
-		now := time.Now()
-		if next.nextRun.After(now) {
-			timer := time.NewTimer(next.nextRun.Sub(now))
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				s.stopWorkers()
-				return nil
-			case <-timer.C:
-			}
-		}
-
-		item := heap.Pop(h).(*scheduledItem)
-
-		select {
-		case <-ctx.Done():
-			s.stopWorkers()
-			return nil
-		case s.jobsCh <- job{svc: item.svc}:
-		}
-
-		interval, _ := time.ParseDuration(item.svc.Interval)
-		item.nextRun = time.Now().Add(interval).Add(s.randJitter())
-		heap.Push(h, item)
+	if len(added)+len(removed)+len(changed) > 0 {
+		s.log.Info("schedule reloaded",
+			"added", added,
+			"removed", removed,
+			"changed", changed,
+		)
+	} else {
+		s.log.Info("schedule reloaded (no changes)")
 	}
+}
+
+func servicesEqualForSchedule(a, b config.Service) bool {
+	// Compare only scheduling/check-relevant fields
+	return a.ID == b.ID &&
+		a.Type == b.Type &&
+		a.Interval == b.Interval &&
+		a.Timeout == b.Timeout &&
+		a.URL == b.URL &&
+		a.Method == b.Method &&
+		strings.Join(mapToKV(a.Headers), ",") == strings.Join(mapToKV(b.Headers), ",") &&
+		strings.Join(intSliceToStr(a.ExpectedStatus), ",") == strings.Join(intSliceToStr(b.ExpectedStatus), ",") &&
+		a.Contains == b.Contains &&
+		a.Host == b.Host &&
+		a.Port == b.Port
+}
+
+func mapToKV(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k, v := range m {
+		out = append(out, k+"="+v)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func intSliceToStr(in []int) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, n := range in {
+		out = append(out, fmt.Sprintf("%d", n))
+	}
+	return out
 }
 
 func (s *Scheduler) startWorkers(ctx context.Context) {
@@ -213,25 +328,20 @@ func (s *Scheduler) runJob(parent context.Context, workerID int, jb job) {
 	defer cancel()
 
 	start := time.Now()
-	var res checks.Result
 
+	var res checks.Result
 	switch strings.ToLower(strings.TrimSpace(svc.Type)) {
 	case "http":
 		res = s.httpChecker.Check(ctx, svc)
 	case "tcp":
 		res = s.tcpChecker.Check(ctx, svc)
 	default:
-		res = checks.Result{
-			Success: false,
-			Latency: time.Since(start),
-			Error:   "unsupported type",
-		}
+		res = checks.Result{Success: false, Latency: time.Since(start), Error: "unsupported type"}
 	}
 
 	if s.metrics != nil {
 		s.metrics.Observe(svc, res)
 	}
-
 	if s.handler != nil {
 		s.handler.HandleResult(svc, res)
 	}
@@ -241,7 +351,6 @@ func (s *Scheduler) runJob(parent context.Context, workerID int, jb job) {
 		"service_id", svc.ID,
 		"service_name", svc.Name,
 		"type", svc.Type,
-		"url", svc.URL,
 		"success", res.Success,
 		"status_code", res.StatusCode,
 		"latency_ms", res.Latency.Milliseconds(),
