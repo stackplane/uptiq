@@ -8,15 +8,23 @@ import (
 	"time"
 )
 
+// TCP checker configuration constants.
+const (
+	tcpDialTimeout = 5 * time.Second
+	tcpKeepAlive   = 30 * time.Second
+)
+
+// TCPChecker performs TCP connectivity checks.
 type TCPChecker struct {
 	dialer net.Dialer
 }
 
+// NewTCPChecker creates a new TCPChecker instance.
 func NewTCPChecker() *TCPChecker {
 	return &TCPChecker{
 		dialer: net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   tcpDialTimeout,
+			KeepAlive: tcpKeepAlive,
 		},
 	}
 }

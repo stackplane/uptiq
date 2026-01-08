@@ -1,3 +1,4 @@
+// Package scheduler manages check scheduling and execution.
 package scheduler
 
 import (
@@ -17,91 +18,68 @@ import (
 	"sitelert/internal/metrics"
 )
 
+// Default configuration values.
+const (
+	defaultInterval     = 30 * time.Second
+	defaultTimeout      = 5 * time.Second
+	defaultWaitInterval = 500 * time.Millisecond
+	minWorkerCount      = 1
+)
+
+// ResultHandler processes check results.
 type ResultHandler interface {
 	HandleResult(svc config.Service, res checks.Result)
 }
 
+// Scheduler manages periodic health checks.
 type Scheduler struct {
 	log         *slog.Logger
 	workerCount int
 	jitter      time.Duration
 
-	httpChecker *checks.HTTPChecker
-	tcpChecker  *checks.TCPChecker
+	checkers *checks.Factory
+	metrics  *metrics.Collector
+	handler  ResultHandler
 
-	metrics *metrics.Metrics
-	handler ResultHandler
-
-	jobsCh   chan job
+	jobsCh   chan config.Service
 	updateCh chan []config.Service
 
 	wg sync.WaitGroup
 }
 
-type job struct {
-	svc config.Service
-}
-
-type scheduledItem struct {
-	svc     config.Service
-	nextRun time.Time
-	index   int
-}
-
-type scheduleHeap []*scheduledItem
-
-func (h scheduleHeap) Len() int           { return len(h) }
-func (h scheduleHeap) Less(i, j int) bool { return h[i].nextRun.Before(h[j].nextRun) }
-func (h scheduleHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
-func (h *scheduleHeap) Push(x any)        { *h = append(*h, x.(*scheduledItem)) }
-func (h *scheduleHeap) Pop() any {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	*h = old[:n-1]
-	return item
-}
-func (h scheduleHeap) Peek() *scheduledItem {
-	if len(h) == 0 {
-		return nil
-	}
-	return h[0]
-}
-
-func New(cfg *config.SitelertConfig, log *slog.Logger, m *metrics.Metrics, handler ResultHandler) (*Scheduler, error) {
+// New creates a new scheduler.
+func New(cfg *config.Config, log *slog.Logger, m *metrics.Collector, handler ResultHandler) (*Scheduler, error) {
 	if log == nil {
 		log = slog.Default()
 	}
 
-	j, err := time.ParseDuration(cfg.Global.Jitter)
+	jitter, err := time.ParseDuration(cfg.Global.Jitter)
 	if err != nil {
 		return nil, fmt.Errorf("parse global.jitter: %w", err)
 	}
 
 	workerCount := cfg.Global.WorkerCount
-	if workerCount < 1 {
-		workerCount = 1
+	if workerCount < minWorkerCount {
+		workerCount = minWorkerCount
 	}
 
 	return &Scheduler{
 		log:         log,
 		workerCount: workerCount,
-		jitter:      j,
-		httpChecker: checks.NewHTTPChecker(),
-		tcpChecker:  checks.NewTCPChecker(),
+		jitter:      jitter,
+		checkers:    checks.NewFactory(),
 		metrics:     m,
 		handler:     handler,
-		jobsCh:      make(chan job, workerCount*4),
+		jobsCh:      make(chan config.Service, workerCount*4),
 		updateCh:    make(chan []config.Service, 1),
 	}, nil
 }
 
-// UpdateServices triggers a schedule rebuild. It does not stop workers.
+// UpdateServices triggers a schedule rebuild with new services.
 func (s *Scheduler) UpdateServices(services []config.Service) {
-	// Keep only the latest update
+	// Keep only the latest update (drop older pending updates)
 	select {
 	case s.updateCh <- services:
-		return
 	default:
 		select {
 		case <-s.updateCh:
@@ -111,37 +89,19 @@ func (s *Scheduler) UpdateServices(services []config.Service) {
 	}
 }
 
+// Start begins the scheduling loop.
 func (s *Scheduler) Start(ctx context.Context, services []config.Service) error {
 	s.startWorkers(ctx)
 
-	h := &scheduleHeap{}
-	heap.Init(h)
+	h := newScheduleHeap()
 	s.rebuildHeap(h, services)
 
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
 	for {
-		next := h.Peek()
-		var wait time.Duration
-		if next == nil {
-			wait = 500 * time.Millisecond
-		} else {
-			now := time.Now()
-			if next.nextRun.After(now) {
-				wait = next.nextRun.Sub(now)
-			} else {
-				wait = 0
-			}
-		}
-
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(wait)
+		wait := s.nextWaitDuration(h)
+		resetTimer(timer, wait)
 
 		select {
 		case <-ctx.Done():
@@ -150,88 +110,65 @@ func (s *Scheduler) Start(ctx context.Context, services []config.Service) error 
 			return nil
 
 		case newServices := <-s.updateCh:
-			// Rebuild schedule immediately on reload
 			s.rebuildHeap(h, newServices)
 
 		case <-timer.C:
-			item := h.Peek()
-			if item == nil {
-				continue
-			}
-			if item.nextRun.After(time.Now()) {
-				continue
-			}
-
-			// Due
-			item = heap.Pop(h).(*scheduledItem)
-			select {
-			case <-ctx.Done():
-				s.stopWorkers()
-				return nil
-			case s.jobsCh <- job{svc: item.svc}:
-			}
-
-			interval, err := time.ParseDuration(item.svc.Interval)
-			if err != nil || interval <= 0 {
-				interval = 30 * time.Second
-			}
-			item.nextRun = time.Now().Add(interval).Add(s.randJitter())
-			heap.Push(h, item)
+			s.processReadyItems(ctx, h)
 		}
 	}
 }
 
+func (s *Scheduler) nextWaitDuration(h *scheduleHeap) time.Duration {
+	next := h.Peek()
+	if next == nil {
+		return defaultWaitInterval
+	}
+
+	wait := time.Until(next.nextRun)
+	if wait < 0 {
+		return 0
+	}
+	return wait
+}
+
+func (s *Scheduler) processReadyItems(ctx context.Context, h *scheduleHeap) {
+	for {
+		item := h.Peek()
+		if item == nil || item.nextRun.After(time.Now()) {
+			return
+		}
+
+		item = heap.Pop(h).(*scheduledItem)
+
+		select {
+		case <-ctx.Done():
+			return
+		case s.jobsCh <- item.service:
+		}
+
+		// Reschedule
+		interval := parseIntervalOrDefault(item.service.Interval)
+		item.nextRun = time.Now().Add(interval).Add(s.randomJitter())
+		heap.Push(h, item)
+	}
+}
+
 func (s *Scheduler) rebuildHeap(h *scheduleHeap, services []config.Service) {
-	// Diff logging: added/removed/changed (best-effort)
-	prev := make(map[string]config.Service)
-	for _, it := range *h {
-		prev[it.svc.ID] = it.svc
-	}
-	next := make(map[string]config.Service)
-	for _, svc := range services {
-		next[svc.ID] = svc
-	}
+	prev := s.collectServiceIDs(h)
 
-	var added, removed, changed []string
-	for id, svc := range next {
-		if old, ok := prev[id]; !ok {
-			added = append(added, id)
-		} else if !servicesEqualForSchedule(old, svc) {
-			changed = append(changed, id)
-		}
-	}
-	for id := range prev {
-		if _, ok := next[id]; !ok {
-			removed = append(removed, id)
-		}
-	}
-
-	// Clear heap and rebuild
-	*h = (*h)[:0]
-	heap.Init(h)
+	h.clear()
 
 	now := time.Now()
+	current := make(map[string]config.Service)
+
 	for _, svc := range services {
-		typ := strings.ToLower(strings.TrimSpace(svc.Type))
-		if typ != "http" && typ != "tcp" {
-			s.log.Warn("skipping unsupported service type",
-				"service_id", svc.ID,
-				"service_name", svc.Name,
-				"type", svc.Type,
-			)
+		if !s.isValidServiceType(svc) {
 			continue
 		}
 
-		interval, err := time.ParseDuration(svc.Interval)
-		if err != nil || interval <= 0 {
-			s.log.Warn("invalid interval; using fallback",
-				"service_id", svc.ID,
-				"interval", svc.Interval,
-			)
-		}
-
-		first := now.Add(s.randJitter())
-		heap.Push(h, &scheduledItem{svc: svc, nextRun: first})
+		current[svc.ID] = svc
+		first := now.Add(s.randomJitter())
+		heap.Push(h, &scheduledItem{service: svc, nextRun: first})
 
 		s.log.Info("scheduled service",
 			"service_id", svc.ID,
@@ -240,6 +177,47 @@ func (s *Scheduler) rebuildHeap(h *scheduleHeap, services []config.Service) {
 			"interval", svc.Interval,
 			"timeout", svc.Timeout,
 		)
+	}
+
+	s.logScheduleChanges(prev, current)
+}
+
+func (s *Scheduler) collectServiceIDs(h *scheduleHeap) map[string]config.Service {
+	result := make(map[string]config.Service)
+	for _, item := range *h {
+		result[item.service.ID] = item.service
+	}
+	return result
+}
+
+func (s *Scheduler) isValidServiceType(svc config.Service) bool {
+	typ := strings.ToLower(strings.TrimSpace(svc.Type))
+	if typ != "http" && typ != "tcp" {
+		s.log.Warn("skipping unsupported service type",
+			"service_id", svc.ID,
+			"service_name", svc.Name,
+			"type", svc.Type,
+		)
+		return false
+	}
+	return true
+}
+
+func (s *Scheduler) logScheduleChanges(prev, current map[string]config.Service) {
+	var added, removed, changed []string
+
+	for id, svc := range current {
+		if old, ok := prev[id]; !ok {
+			added = append(added, id)
+		} else if !servicesEqual(old, svc) {
+			changed = append(changed, id)
+		}
+	}
+
+	for id := range prev {
+		if _, ok := current[id]; !ok {
+			removed = append(removed, id)
+		}
 	}
 
 	if len(added)+len(removed)+len(changed) > 0 {
@@ -253,61 +231,26 @@ func (s *Scheduler) rebuildHeap(h *scheduleHeap, services []config.Service) {
 	}
 }
 
-func servicesEqualForSchedule(a, b config.Service) bool {
-	// Compare only scheduling/check-relevant fields
-	return a.ID == b.ID &&
-		a.Type == b.Type &&
-		a.Interval == b.Interval &&
-		a.Timeout == b.Timeout &&
-		a.URL == b.URL &&
-		a.Method == b.Method &&
-		strings.Join(mapToKV(a.Headers), ",") == strings.Join(mapToKV(b.Headers), ",") &&
-		strings.Join(intSliceToStr(a.ExpectedStatus), ",") == strings.Join(intSliceToStr(b.ExpectedStatus), ",") &&
-		a.Contains == b.Contains &&
-		a.Host == b.Host &&
-		a.Port == b.Port
-}
-
-func mapToKV(m map[string]string) []string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(m))
-	for k, v := range m {
-		out = append(out, k+"="+v)
-	}
-	slices.Sort(out)
-	return out
-}
-
-func intSliceToStr(in []int) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(in))
-	for _, n := range in {
-		out = append(out, fmt.Sprintf("%d", n))
-	}
-	return out
-}
-
 func (s *Scheduler) startWorkers(ctx context.Context) {
 	for i := 0; i < s.workerCount; i++ {
 		s.wg.Add(1)
-		go func(workerID int) {
-			defer s.wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case jb, ok := <-s.jobsCh:
-					if !ok {
-						return
-					}
-					s.runJob(ctx, workerID, jb)
-				}
+		go s.worker(ctx, i+1)
+	}
+}
+
+func (s *Scheduler) worker(ctx context.Context, id int) {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case svc, ok := <-s.jobsCh:
+			if !ok {
+				return
 			}
-		}(i + 1)
+			s.runCheck(ctx, id, svc)
+		}
 	}
 }
 
@@ -316,28 +259,13 @@ func (s *Scheduler) stopWorkers() {
 	s.wg.Wait()
 }
 
-func (s *Scheduler) runJob(parent context.Context, workerID int, jb job) {
-	svc := jb.svc
-
-	timeout, err := time.ParseDuration(svc.Timeout)
-	if err != nil || timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-
+func (s *Scheduler) runCheck(parent context.Context, workerID int, svc config.Service) {
+	timeout := parseTimeoutOrDefault(svc.Timeout)
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	start := time.Now()
-
-	var res checks.Result
-	switch strings.ToLower(strings.TrimSpace(svc.Type)) {
-	case "http":
-		res = s.httpChecker.Check(ctx, svc)
-	case "tcp":
-		res = s.tcpChecker.Check(ctx, svc)
-	default:
-		res = checks.Result{Success: false, Latency: time.Since(start), Error: "unsupported type"}
-	}
+	res := s.checkers.Check(ctx, svc)
 
 	if s.metrics != nil {
 		s.metrics.Observe(svc, res)
@@ -346,6 +274,10 @@ func (s *Scheduler) runJob(parent context.Context, workerID int, jb job) {
 		s.handler.HandleResult(svc, res)
 	}
 
+	s.logCheckResult(workerID, svc, res, start)
+}
+
+func (s *Scheduler) logCheckResult(workerID int, svc config.Service, res checks.Result, start time.Time) {
 	fields := []any{
 		"worker", workerID,
 		"service_id", svc.ID,
@@ -355,25 +287,85 @@ func (s *Scheduler) runJob(parent context.Context, workerID int, jb job) {
 		"status_code", res.StatusCode,
 		"latency_ms", res.Latency.Milliseconds(),
 		"timeout", svc.Timeout,
-	}
-
-	if strings.EqualFold(svc.Type, "http") {
-		fields = append(fields, "target", svc.URL)
-	} else if strings.EqualFold(svc.Type, "tcp") {
-		fields = append(fields, "target", net.JoinHostPort(svc.Host, fmt.Sprintf("%d", svc.Port)))
+		"target", targetForService(svc),
 	}
 
 	if res.Success {
 		s.log.Info("check completed", fields...)
 	} else {
-		fields = append(fields, "error", res.Error, "elapsed_ms", time.Since(start).Milliseconds())
+		fields = append(fields,
+			"error", res.Error,
+			"elapsed_ms", time.Since(start).Milliseconds(),
+		)
 		s.log.Warn("check failed", fields...)
 	}
 }
 
-func (s *Scheduler) randJitter() time.Duration {
+func (s *Scheduler) randomJitter() time.Duration {
 	if s.jitter <= 0 {
 		return 0
 	}
 	return time.Duration(rand.Int63n(int64(s.jitter)))
+}
+
+// Helper functions
+
+func targetForService(svc config.Service) string {
+	if svc.IsHTTP() {
+		return svc.URL
+	}
+	if svc.IsTCP() {
+		return net.JoinHostPort(svc.Host, fmt.Sprintf("%d", svc.Port))
+	}
+	return ""
+}
+
+func parseIntervalOrDefault(s string) time.Duration {
+	if d, err := time.ParseDuration(s); err == nil && d > 0 {
+		return d
+	}
+	return defaultInterval
+}
+
+func parseTimeoutOrDefault(s string) time.Duration {
+	if d, err := time.ParseDuration(s); err == nil && d > 0 {
+		return d
+	}
+	return defaultTimeout
+}
+
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+func servicesEqual(a, b config.Service) bool {
+	return a.ID == b.ID &&
+		a.Type == b.Type &&
+		a.Interval == b.Interval &&
+		a.Timeout == b.Timeout &&
+		a.URL == b.URL &&
+		a.Method == b.Method &&
+		mapsEqual(a.Headers, b.Headers) &&
+		slices.Equal(a.ExpectedStatus, b.ExpectedStatus) &&
+		a.Contains == b.Contains &&
+		a.Host == b.Host &&
+		a.Port == b.Port
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }

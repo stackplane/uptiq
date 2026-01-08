@@ -8,12 +8,41 @@ import (
 	"net"
 	"net/mail"
 	"net/smtp"
-	"sitelert/internal/config"
 	"strings"
 	"time"
+
+	"sitelert/internal/config"
 )
 
-func (e *Engine) sendEmail(ctx context.Context, ch config.Channel, subject, body string) error {
+// Email configuration constants.
+const (
+	emailDialTimeout  = 7 * time.Second
+	emailImplicitPort = 465
+	emailMinTLS       = tls.VersionTLS12
+)
+
+// sendEmail sends an email alert using SMTP.
+func sendEmail(ctx context.Context, ch config.Channel, subject, body string) error {
+	if err := validateEmailConfig(ch); err != nil {
+		return err
+	}
+
+	fromAddr, err := parseEmailAddress(ch.From)
+	if err != nil {
+		return fmt.Errorf("parse from: %w", err)
+	}
+
+	toAddrs, toHeaders, err := parseRecipients(ch.To)
+	if err != nil {
+		return err
+	}
+
+	msg := buildEmailMessage(ch.From, toHeaders, subject, body)
+
+	return sendSMTP(ctx, ch, fromAddr, toAddrs, msg)
+}
+
+func validateEmailConfig(ch config.Channel) error {
 	if strings.TrimSpace(ch.SMTPHost) == "" {
 		return fmt.Errorf("smtp_host is empty")
 	}
@@ -26,77 +55,53 @@ func (e *Engine) sendEmail(ctx context.Context, ch config.Channel, subject, body
 	if len(ch.To) == 0 {
 		return fmt.Errorf("to list is empty")
 	}
+	return nil
+}
 
-	fromHdr := ch.From
-	fromAddr, err := parseAddress(fromHdr)
+func parseEmailAddress(s string) (string, error) {
+	addr, err := mail.ParseAddress(strings.TrimSpace(s))
 	if err != nil {
-		return fmt.Errorf("parse from: %w", err)
+		return "", err
 	}
+	return addr.Address, nil
+}
 
-	var toHdrs []string
-	var toAddrs []string
-	for _, t := range ch.To {
-		t = strings.TrimSpace(t)
-		if t == "" {
+func parseRecipients(recipients []string) (addrs, headers []string, err error) {
+	for _, r := range recipients {
+		r = strings.TrimSpace(r)
+		if r == "" {
 			continue
 		}
-		addr, err := parseAddress(t)
+
+		addr, err := parseEmailAddress(r)
 		if err != nil {
-			return fmt.Errorf("parse to %q: %w", t, err)
+			return nil, nil, fmt.Errorf("parse to %q: %w", r, err)
 		}
-		toHdrs = append(toHdrs, t)
-		toAddrs = append(toAddrs, addr)
-	}
-	if len(toAddrs) == 0 {
-		return fmt.Errorf("no valid recipients in to list")
+
+		addrs = append(addrs, addr)
+		headers = append(headers, r)
 	}
 
-	// Build message (RFC 5322-ish)
-	msg := buildEmail(fromHdr, toHdrs, subject, body)
+	if len(addrs) == 0 {
+		return nil, nil, fmt.Errorf("no valid recipients in to list")
+	}
 
-	// Dial with context
+	return addrs, headers, nil
+}
+
+func sendSMTP(ctx context.Context, ch config.Channel, fromAddr string, toAddrs []string, msg []byte) error {
 	addr := net.JoinHostPort(ch.SMTPHost, fmt.Sprintf("%d", ch.SMTPPort))
-	dialer := &net.Dialer{Timeout: 7 * time.Second}
-
-	var conn net.Conn
-	done := make(chan error, 1)
-	go func() {
-		c, err := dialer.Dial("tcp", addr)
-		if err != nil {
-			done <- err
-			return
-		}
-		conn = c
-		done <- nil
-	}()
-
-	select {
-	case <-ctx.Done():
-		if conn != nil {
-			_ = conn.Close()
-		}
-		return ctx.Err()
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("dial smtp: %w", err)
-		}
+	conn, err := dialWithContext(ctx, addr)
+	if err != nil {
+		return fmt.Errorf("dial smtp: %w", err)
 	}
+	defer conn.Close()
 
-	// Ensure conn closed on failure
-	defer func() {
-		if conn != nil {
-			_ = conn.Close()
-		}
-	}()
-
-	host := ch.SMTPHost
-
-	// Port 465: implicit TLS
-	implicitTLS := ch.SMTPPort == 465
+	implicitTLS := ch.SMTPPort == emailImplicitPort
 	if implicitTLS {
 		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName: host,
-			MinVersion: tls.VersionTLS12,
+			ServerName: ch.SMTPHost,
+			MinVersion: emailMinTLS,
 		})
 		if err := tlsConn.Handshake(); err != nil {
 			return fmt.Errorf("tls handshake: %w", err)
@@ -104,21 +109,18 @@ func (e *Engine) sendEmail(ctx context.Context, ch config.Channel, subject, body
 		conn = tlsConn
 	}
 
-	c, err := smtp.NewClient(conn, host)
+	client, err := smtp.NewClient(conn, ch.SMTPHost)
 	if err != nil {
 		return fmt.Errorf("smtp client: %w", err)
 	}
-	// Once we have smtp client, it owns the conn; avoid double close confusion
-	conn = nil
-	defer func() { _ = c.Close() }()
+	defer client.Close()
 
-	// STARTTLS if available (and not already implicit TLS)
 	isTLS := implicitTLS
 	if !implicitTLS {
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			if err := c.StartTLS(&tls.Config{
-				ServerName: host,
-				MinVersion: tls.VersionTLS12,
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(&tls.Config{
+				ServerName: ch.SMTPHost,
+				MinVersion: emailMinTLS,
 			}); err != nil {
 				return fmt.Errorf("starttls: %w", err)
 			}
@@ -126,88 +128,105 @@ func (e *Engine) sendEmail(ctx context.Context, ch config.Channel, subject, body
 		}
 	}
 
-	// If auth is configured, refuse to send creds without TLS
+	// Refuse to send credentials without TLS
 	authConfigured := strings.TrimSpace(ch.Username) != "" || strings.TrimSpace(ch.Password) != ""
 	if authConfigured && !isTLS {
 		return fmt.Errorf("refusing to authenticate without TLS (enable STARTTLS or use port 465)")
 	}
 
-	// Authenticate if username provided
 	if strings.TrimSpace(ch.Username) != "" {
-		auth := smtp.PlainAuth("", ch.Username, ch.Password, host)
-		if err := c.Auth(auth); err != nil {
+		auth := smtp.PlainAuth("", ch.Username, ch.Password, ch.SMTPHost)
+		if err := client.Auth(auth); err != nil {
 			return fmt.Errorf("smtp auth: %w", err)
 		}
 	}
 
-	// Envelope
-	if err := c.Mail(fromAddr); err != nil {
+	if err := client.Mail(fromAddr); err != nil {
 		return fmt.Errorf("mail from: %w", err)
 	}
+
 	for _, rcpt := range toAddrs {
-		if err := c.Rcpt(rcpt); err != nil {
+		if err := client.Rcpt(rcpt); err != nil {
 			return fmt.Errorf("rcpt to %s: %w", rcpt, err)
 		}
 	}
 
-	w, err := c.Data()
+	writer, err := client.Data()
 	if err != nil {
 		return fmt.Errorf("data: %w", err)
 	}
-	if _, err := w.Write(msg); err != nil {
-		_ = w.Close()
+
+	if _, err := writer.Write(msg); err != nil {
+		writer.Close()
 		return fmt.Errorf("write data: %w", err)
 	}
-	if err := w.Close(); err != nil {
+
+	if err := writer.Close(); err != nil {
 		return fmt.Errorf("close data: %w", err)
 	}
 
-	// Quit politely
-	_ = c.Quit()
+	_ = client.Quit()
 	return nil
 }
 
-func parseAddress(s string) (string, error) {
-	a, err := mail.ParseAddress(strings.TrimSpace(s))
-	if err != nil {
-		return "", err
+func dialWithContext(ctx context.Context, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: emailDialTimeout}
+
+	connCh := make(chan net.Conn, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		conn, err := dialer.Dial("tcp", addr)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		connCh <- conn
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case err := <-errCh:
+		return nil, err
+	case conn := <-connCh:
+		return conn, nil
 	}
-	return a.Address, nil
 }
 
-func buildEmail(from string, to []string, subject, body string) []byte {
-	// Keep it simple: text/plain UTF-8.
-	// Use CRLF line endings for SMTP.
-	var b bytes.Buffer
-	writeHeader(&b, "From", from)
-	writeHeader(&b, "To", strings.Join(to, ", "))
-	writeHeader(&b, "Subject", sanitizeHeader(subject))
-	writeHeader(&b, "Date", time.Now().Format(time.RFC1123Z))
-	writeHeader(&b, "MIME-Version", "1.0")
-	writeHeader(&b, "Content-Type", `text/plain; charset="utf-8"`)
-	writeHeader(&b, "Content-Transfer-Encoding", "8bit")
-	b.WriteString("\r\n")
+func buildEmailMessage(from string, to []string, subject, body string) []byte {
+	var buf bytes.Buffer
 
-	// Body (normalize line endings)
+	writeHeader(&buf, "From", from)
+	writeHeader(&buf, "To", strings.Join(to, ", "))
+	writeHeader(&buf, "Subject", sanitizeHeader(subject))
+	writeHeader(&buf, "Date", time.Now().Format(time.RFC1123Z))
+	writeHeader(&buf, "MIME-Version", "1.0")
+	writeHeader(&buf, "Content-Type", `text/plain; charset="utf-8"`)
+	writeHeader(&buf, "Content-Transfer-Encoding", "8bit")
+	buf.WriteString("\r\n")
+
+	// Normalize line endings to CRLF
 	body = strings.ReplaceAll(body, "\r\n", "\n")
 	body = strings.ReplaceAll(body, "\r", "\n")
 	body = strings.ReplaceAll(body, "\n", "\r\n")
-	b.WriteString(body)
+	buf.WriteString(body)
+
 	if !strings.HasSuffix(body, "\r\n") {
-		b.WriteString("\r\n")
+		buf.WriteString("\r\n")
 	}
-	return b.Bytes()
+
+	return buf.Bytes()
 }
 
-func writeHeader(b *bytes.Buffer, k, v string) {
-	b.WriteString(k)
-	b.WriteString(": ")
-	b.WriteString(v)
-	b.WriteString("\r\n")
+func writeHeader(buf *bytes.Buffer, key, value string) {
+	buf.WriteString(key)
+	buf.WriteString(": ")
+	buf.WriteString(value)
+	buf.WriteString("\r\n")
 }
 
 func sanitizeHeader(s string) string {
-	// Prevent header injection
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
 	return strings.TrimSpace(s)

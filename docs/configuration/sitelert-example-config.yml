@@ -1,0 +1,341 @@
+# -----------------------------------------------------------------------------
+# Global Settings
+# -----------------------------------------------------------------------------
+# These settings apply to the entire application.
+
+global:
+  # Address and port for the HTTP server (healthz and metrics endpoints)
+  # Format: "host:port"
+  # Default: "0.0.0.0:8080"
+  scrape_bind: "0.0.0.0:8080"
+
+  # Logging verbosity level
+  # Options: debug, info, warn, error
+  # Default: "info"
+  log_level: "info"
+
+  # Default timeout for health checks (used when service doesn't specify one)
+  # Format: Go duration string (e.g., "5s", "1m", "500ms")
+  # Default: "5s"
+  default_timeout: "5s"
+
+  # Default interval between checks (used when service doesn't specify one)
+  # Format: Go duration string
+  # Default: "30s"
+  default_interval: "30s"
+
+  # Number of concurrent workers executing checks
+  # Range: 1-1000
+  # Default: 10
+  worker_count: 10
+
+  # Random jitter added to check intervals to prevent thundering herd
+  # Format: Go duration string (0s to disable)
+  # Default: "0s"
+  jitter: "500ms"
+
+# -----------------------------------------------------------------------------
+# Services
+# -----------------------------------------------------------------------------
+# Define the endpoints and services to monitor.
+# Each service must have a unique ID.
+
+services:
+  # -------------------------
+  # HTTP Service Examples
+  # -------------------------
+
+  # Basic website monitoring
+  - id: "company-website"
+    name: "Company Website"
+    type: "http"
+    url: "https://www.example.com"
+    interval: "30s"
+    timeout: "5s"
+    # Accept any 2xx or 3xx status (default behavior when expected_status omitted)
+
+  # API health endpoint with specific status codes
+  - id: "api-health"
+    name: "API Health Check"
+    type: "http"
+    url: "https://api.example.com/health"
+    method: "GET"                    # GET, POST, PUT, DELETE, HEAD, etc.
+    interval: "15s"
+    timeout: "3s"
+    expected_status: [200]           # Only accept 200 OK
+
+  # API endpoint with body content validation
+  - id: "api-ready"
+    name: "API Readiness"
+    type: "http"
+    url: "https://api.example.com/ready"
+    interval: "20s"
+    timeout: "5s"
+    expected_status: [200]
+    contains: "\"status\":\"healthy\""  # Response body must contain this string
+
+  # Authenticated API endpoint
+  - id: "api-authenticated"
+    name: "Authenticated API"
+    type: "http"
+    url: "https://api.example.com/v1/status"
+    method: "GET"
+    interval: "1m"
+    timeout: "10s"
+    expected_status: [200, 201]
+    headers:
+      Authorization: "Bearer ${API_TOKEN}"
+      Accept: "application/json"
+      X-Request-ID: "sitelert-monitor"
+
+  # POST endpoint monitoring
+  - id: "webhook-endpoint"
+    name: "Webhook Receiver"
+    type: "http"
+    url: "https://api.example.com/webhooks/test"
+    method: "POST"
+    interval: "5m"
+    timeout: "10s"
+    expected_status: [200, 202, 204]
+    headers:
+      Content-Type: "application/json"
+
+  # CDN / Static assets
+  - id: "cdn-assets"
+    name: "CDN Static Assets"
+    type: "http"
+    url: "https://cdn.example.com/assets/app.js"
+    interval: "2m"
+    timeout: "5s"
+    expected_status: [200, 304]
+
+  # External dependency monitoring
+  - id: "stripe-api"
+    name: "Stripe API"
+    type: "http"
+    url: "https://api.stripe.com/v1"
+    interval: "1m"
+    timeout: "5s"
+    expected_status: [401]           # Expect 401 without auth (proves API is up)
+
+  # Internal microservice
+  - id: "user-service"
+    name: "User Service"
+    type: "http"
+    url: "http://user-service.internal:8080/health"
+    interval: "10s"
+    timeout: "2s"
+    expected_status: [200]
+    contains: "ok"
+
+  # -------------------------
+  # TCP Service Examples
+  # -------------------------
+
+  # Database connectivity
+  - id: "postgres-primary"
+    name: "PostgreSQL Primary"
+    type: "tcp"
+    host: "db-primary.example.com"
+    port: 5432
+    interval: "15s"
+    timeout: "3s"
+
+  # Redis cache
+  - id: "redis-cache"
+    name: "Redis Cache"
+    type: "tcp"
+    host: "redis.example.com"
+    port: 6379
+    interval: "10s"
+    timeout: "2s"
+
+  # SSH bastion host
+  - id: "ssh-bastion"
+    name: "SSH Bastion"
+    type: "tcp"
+    host: "bastion.example.com"
+    port: 22
+    interval: "30s"
+    timeout: "5s"
+
+  # SMTP mail server
+  - id: "smtp-server"
+    name: "SMTP Server"
+    type: "tcp"
+    host: "mail.example.com"
+    port: 587
+    interval: "1m"
+    timeout: "5s"
+
+  # Elasticsearch
+  - id: "elasticsearch"
+    name: "Elasticsearch"
+    type: "tcp"
+    host: "es.example.com"
+    port: 9200
+    interval: "30s"
+    timeout: "5s"
+
+  # RabbitMQ
+  - id: "rabbitmq"
+    name: "RabbitMQ"
+    type: "tcp"
+    host: "rabbitmq.example.com"
+    port: 5672
+    interval: "20s"
+    timeout: "3s"
+
+  # Kafka broker
+  - id: "kafka-broker-1"
+    name: "Kafka Broker 1"
+    type: "tcp"
+    host: "kafka-1.example.com"
+    port: 9092
+    interval: "15s"
+    timeout: "3s"
+
+  # MongoDB
+  - id: "mongodb"
+    name: "MongoDB"
+    type: "tcp"
+    host: "${MONGO_HOST}"            # Use environment variable
+    port: 27017
+    interval: "15s"
+    timeout: "3s"
+
+# -----------------------------------------------------------------------------
+# Alerting Configuration
+# -----------------------------------------------------------------------------
+# Define notification channels and routing rules.
+
+alerting:
+  # ---------------------------
+  # Notification Channels
+  # ---------------------------
+  # Define where alerts are sent. Each channel has a unique name.
+
+  channels:
+    # Discord webhook
+    discord-ops:
+      type: "discord"
+      webhook_url: "${DISCORD_WEBHOOK_URL}"
+
+    # Slack webhook
+    slack-engineering:
+      type: "slack"
+      webhook_url: "${SLACK_WEBHOOK_URL}"
+
+    # Another Slack channel for critical alerts
+    slack-oncall:
+      type: "slack"
+      webhook_url: "${SLACK_ONCALL_WEBHOOK_URL}"
+
+    # Email - Basic (no authentication)
+    email-team:
+      type: "email"
+      smtp_host: "localhost"
+      smtp_port: 25
+      from: "Sitelert <alerts@example.com>"
+      to:
+        - "team@example.com"
+
+    # Email - With STARTTLS authentication (port 587)
+    email-ops:
+      type: "email"
+      smtp_host: "smtp.gmail.com"
+      smtp_port: 587
+      username: "${SMTP_USERNAME}"
+      password: "${SMTP_PASSWORD}"
+      from: "Sitelert Monitoring <alerts@example.com>"
+      to:
+        - "ops@example.com"
+        - "oncall@example.com"
+
+    # Email - With implicit TLS (port 465)
+    email-management:
+      type: "email"
+      smtp_host: "smtp.office365.com"
+      smtp_port: 465
+      username: "${SMTP_USERNAME}"
+      password: "${SMTP_PASSWORD}"
+      from: "Infrastructure Alerts <infra@example.com>"
+      to:
+        - "management@example.com"
+        - "cto@example.com"
+
+  # ---------------------------
+  # Alert Routing Rules
+  # ---------------------------
+  # Define which services trigger which channels, and with what policy.
+  # Routes are evaluated in order; a service can match multiple routes.
+
+  routes:
+    # Critical production services - immediate alerts, multiple channels
+    - match:
+        service_ids:
+          - "company-website"
+          - "api-health"
+          - "api-ready"
+          - "postgres-primary"
+      policy:
+        failure_threshold: 1         # Alert on first failure
+        cooldown: "5m"               # Don't repeat alerts more than every 5 minutes
+        recovery_alert: true         # Send notification when service recovers
+      notify:
+        - "slack-oncall"
+        - "email-ops"
+        - "discord-ops"
+
+    # Important but less critical services
+    - match:
+        service_ids:
+          - "user-service"
+          - "redis-cache"
+          - "elasticsearch"
+          - "rabbitmq"
+      policy:
+        failure_threshold: 3         # Alert after 3 consecutive failures
+        cooldown: "10m"
+        recovery_alert: true
+      notify:
+        - "slack-engineering"
+        - "discord-ops"
+
+    # Infrastructure services - alert engineering team
+    - match:
+        service_ids:
+          - "ssh-bastion"
+          - "smtp-server"
+          - "kafka-broker-1"
+          - "mongodb"
+      policy:
+        failure_threshold: 2
+        cooldown: "15m"
+        recovery_alert: true
+      notify:
+        - "slack-engineering"
+        - "email-team"
+
+    # External dependencies - longer threshold, less urgent
+    - match:
+        service_ids:
+          - "stripe-api"
+          - "cdn-assets"
+      policy:
+        failure_threshold: 5         # External services can be flaky
+        cooldown: "30m"
+        recovery_alert: false        # Don't notify on recovery
+      notify:
+        - "slack-engineering"
+
+    # Development/staging services - minimal alerting
+    - match:
+        service_ids:
+          - "webhook-endpoint"
+      policy:
+        failure_threshold: 10
+        cooldown: "1h"
+        recovery_alert: false
+      notify:
+        - "discord-ops"

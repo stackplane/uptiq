@@ -1,304 +1,133 @@
+// Package alerting provides alert routing and dispatch.
 package alerting
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
+	"strings"
+	"time"
+
 	"sitelert/internal/checks"
 	"sitelert/internal/config"
-	"slices"
-	"strings"
-	"sync"
-	"time"
 )
 
-type AlertState string
-
-const (
-	StateUnknown AlertState = "UNKNOWN"
-	StateUp      AlertState = "UP"
-	StateDown    AlertState = "DOWN"
-)
-
-type serviceState struct {
-	State               AlertState
-	ConsecutiveFailures int
-
-	// For DOWN alert throttling
-	LastDownAlertAt time.Time
-	DownNotified    bool // whether we sent a DOWN alert for the current/most recent outage episode
-
-	// For recovery behavior
-	LastResultAt time.Time
-}
-
-type compiledRoute struct {
-	matchServiceIDs []string
-	notify          []string
-	policy          compiledPolicy
-}
-
-type compiledPolicy struct {
-	failureThreshold int
-	cooldown         time.Duration
-	recoveryAlert    bool
-}
-
+// Engine manages alert state and dispatches notifications.
 type Engine struct {
 	log      *slog.Logger
-	client   *http.Client
 	channels map[string]config.Channel
-
-	// routing
-	routes     []compiledRoute
-	routeIndex map[string][]int // service_id -> route indices
-
-	// state
-	mu    sync.Mutex
-	state map[string]*serviceState
+	router   *Router
+	state    *StateManager
+	sender   *ChannelSender
+	messages *MessageBuilder
 }
 
+// NewEngine creates an alerting engine from configuration.
 func NewEngine(cfg config.AlertingConfig, log *slog.Logger) *Engine {
 	if log == nil {
 		log = slog.Default()
 	}
 
-	e := &Engine{
-		log:        log,
-		client:     &http.Client{Timeout: 7 * time.Second},
-		channels:   cfg.Channels,
-		routeIndex: make(map[string][]int),
-		state:      make(map[string]*serviceState),
+	return &Engine{
+		log:      log,
+		channels: cfg.Channels,
+		router:   NewRouter(cfg),
+		state:    NewStateManager(),
+		sender:   NewChannelSender(),
+		messages: NewMessageBuilder(),
 	}
-
-	// Compile routes once
-	for i, r := range cfg.Routes {
-		cr := compiledRoute{
-			matchServiceIDs: trimAll(r.Match.ServiceIDs),
-			notify:          trimAll(r.Notify),
-			policy:          compilePolicy(r.Policy),
-		}
-		e.routes = append(e.routes, cr)
-
-		for _, id := range cr.matchServiceIDs {
-			if id == "" {
-				continue
-			}
-			e.routeIndex[id] = append(e.routeIndex[id], i)
-		}
-	}
-
-	return e
 }
 
-func compilePolicy(p config.RoutePolicy) compiledPolicy {
-	// defaults
-	out := compiledPolicy{
-		failureThreshold: 1,
-		cooldown:         0,
-		recoveryAlert:    p.RecoveryAlert,
-	}
-	if p.FailureThreshold > 0 {
-		out.failureThreshold = p.FailureThreshold
-	}
-	if strings.TrimSpace(p.Cooldown) != "" {
-		if d, err := time.ParseDuration(p.Cooldown); err == nil && d > 0 {
-			out.cooldown = d
-		}
-	}
-	return out
-}
-
-func trimAll(in []string) []string {
-	var out []string
-	for _, s := range in {
-		s = strings.TrimSpace(s)
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-// ---- Routing ----
-
-type resolvedRoute struct {
-	notify []string
-	policy compiledPolicy
-	ok     bool
-}
-
-// resolveRoute unions channels across all matching routes and merges policy conservatively:
-// - failure_threshold: max (reduces spam)
-// - cooldown: max (reduces spam)
-// - recovery_alert: true if any route enables it
-func (e *Engine) resolveRoute(serviceID string) resolvedRoute {
-	idxs := e.routeIndex[serviceID]
-	if len(idxs) == 0 {
-		return resolvedRoute{ok: false}
-	}
-
-	var notify []string
-	policy := compiledPolicy{failureThreshold: 1} // baseline
-
-	first := true
-	for _, idx := range idxs {
-		r := e.routes[idx]
-		for _, ch := range r.notify {
-			if !slices.Contains(notify, ch) {
-				notify = append(notify, ch)
-			}
-		}
-		if first {
-			policy = r.policy
-			first = false
-		} else {
-			// merge
-			if r.policy.failureThreshold > policy.failureThreshold {
-				policy.failureThreshold = r.policy.failureThreshold
-			}
-			if r.policy.cooldown > policy.cooldown {
-				policy.cooldown = r.policy.cooldown
-			}
-			if r.policy.recoveryAlert {
-				policy.recoveryAlert = true
-			}
-		}
-	}
-
-	if len(notify) == 0 {
-		return resolvedRoute{ok: false}
-	}
-
-	return resolvedRoute{notify: notify, policy: policy, ok: true}
-}
-
-// ---- Dispatch payload (payload change for Milestone 6) ----
-
-type dispatchPayload struct {
-	kind string // "down" | "recovery"
-
-	webhookMessage string // used for discord/slack
-
-	emailSubject string
-	emailBody    string
-}
-
-// ---- Public API called by scheduler ----
-
+// HandleResult processes a check result and sends alerts as needed.
 func (e *Engine) HandleResult(svc config.Service, res checks.Result) {
-	route := e.resolveRoute(svc.ID)
-	if !route.ok {
-		// no routing configured for this service
-		return
+	route := e.router.Resolve(svc.ID)
+	if !route.Valid {
+		return // No routing configured for this service
 	}
 
 	now := time.Now()
+	var payload *AlertPayload
 
-	var (
-		sendDown      bool
-		sendDownAgain bool
-		sendRecovery  bool
+	e.state.WithState(svc.ID, func(st *ServiceState) {
+		st.LastResultAt = now
 
-		payload dispatchPayload
-	)
-
-	e.mu.Lock()
-	st := e.state[svc.ID]
-	if st == nil {
-		st = &serviceState{State: StateUnknown}
-		e.state[svc.ID] = st
-	}
-	st.LastResultAt = now
-
-	if res.Success {
-		// Reset failure streak
-		st.ConsecutiveFailures = 0
-
-		// Recovery alert if we were DOWN and had previously sent a down alert
-		if st.State == StateDown {
-			if route.policy.recoveryAlert && st.DownNotified {
-				sendRecovery = true
-				payload = dispatchPayload{
-					kind:           "recovery",
-					webhookMessage: formatRecoveryMessage(svc, res),
-					emailSubject:   emailSubjectRecovery(svc),
-					emailBody:      emailBodyRecovery(svc, res),
-				}
-			}
-			// new episode begins; reset flag
-			st.DownNotified = false
+		if res.Success {
+			payload = e.handleSuccess(svc, res, st, route)
+		} else {
+			payload = e.handleFailure(svc, res, st, route, now)
 		}
+	})
+
+	if payload != nil {
+		e.dispatch(route.Channels, svc, *payload)
+	}
+}
+
+func (e *Engine) handleSuccess(svc config.Service, res checks.Result, st *ServiceState, route ResolvedRoute) *AlertPayload {
+	st.ConsecutiveFailures = 0
+
+	// Send recovery alert if transitioning from DOWN and we had notified
+	if st.State == StateDown && route.Policy.RecoveryAlert && st.DownNotified {
+		payload := e.messages.RecoveryAlert(svc, res)
+		st.DownNotified = false
 		st.State = StateUp
-		e.mu.Unlock()
-
-		if sendRecovery {
-			e.dispatch(route.notify, svc, payload)
-		}
-		return
+		return &payload
 	}
 
-	// failure case
+	st.DownNotified = false
+	st.State = StateUp
+	return nil
+}
+
+func (e *Engine) handleFailure(svc config.Service, res checks.Result, st *ServiceState, route ResolvedRoute, now time.Time) *AlertPayload {
 	st.ConsecutiveFailures++
 
 	// Not yet considered "down" until threshold reached
-	if st.ConsecutiveFailures < route.policy.failureThreshold {
-		// Keep state UP unless already DOWN
+	if st.ConsecutiveFailures < route.Policy.FailureThreshold {
 		if st.State == StateUnknown {
 			st.State = StateUp
 		}
-		e.mu.Unlock()
-		return
+		return nil
 	}
 
 	// Threshold reached: service is DOWN
 	wasDown := st.State == StateDown
 	st.State = StateDown
 
-	// Decide if we can send a DOWN alert now (cooldown)
-	canSendDown := route.policy.cooldown <= 0 ||
-		st.LastDownAlertAt.IsZero() ||
-		now.Sub(st.LastDownAlertAt) >= route.policy.cooldown
+	canSendAlert := e.canSendDownAlert(st, route.Policy, now)
 
-	// First DOWN alert of an outage episode
-	if !st.DownNotified && canSendDown {
-		sendDown = true
+	// First DOWN alert of an outage
+	if !st.DownNotified && canSendAlert {
 		st.DownNotified = true
 		st.LastDownAlertAt = now
+		payload := e.messages.DownAlert(svc, res, st.ConsecutiveFailures, route.Policy.FailureThreshold)
+		return &payload
+	}
 
-		payload = dispatchPayload{
-			kind:           "down",
-			webhookMessage: formatDownMessage(svc, res, st.ConsecutiveFailures, route.policy.failureThreshold, false),
-			emailSubject:   emailSubjectDown(svc),
-			emailBody:      emailBodyDown(svc, res, st.ConsecutiveFailures, route.policy.failureThreshold),
-		}
-	} else if wasDown && st.DownNotified && canSendDown {
-		// Optional reminder while still down (cooldown elapsed)
-		sendDownAgain = true
+	// Reminder while still down (cooldown elapsed)
+	if wasDown && st.DownNotified && canSendAlert {
 		st.LastDownAlertAt = now
-
-		subj := emailSubjectDown(svc) + " (still down)"
-		payload = dispatchPayload{
-			kind:           "down",
-			webhookMessage: formatDownMessage(svc, res, st.ConsecutiveFailures, route.policy.failureThreshold, true),
-			emailSubject:   subj,
-			emailBody:      emailBodyDown(svc, res, st.ConsecutiveFailures, route.policy.failureThreshold),
-		}
+		payload := e.messages.StillDownAlert(svc, res, st.ConsecutiveFailures, route.Policy.FailureThreshold)
+		return &payload
 	}
-	e.mu.Unlock()
 
-	if sendDown || sendDownAgain {
-		e.dispatch(route.notify, svc, payload)
-	}
+	return nil
 }
 
-// ---- Dispatch to channels ----
+func (e *Engine) canSendDownAlert(st *ServiceState, policy ResolvedPolicy, now time.Time) bool {
+	if policy.Cooldown <= 0 {
+		return true
+	}
+	if st.LastDownAlertAt.IsZero() {
+		return true
+	}
+	return now.Sub(st.LastDownAlertAt) >= policy.Cooldown
+}
 
-func (e *Engine) dispatch(channelNames []string, svc config.Service, p dispatchPayload) {
+func (e *Engine) dispatch(channelNames []string, svc config.Service, payload AlertPayload) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	for _, name := range channelNames {
 		ch, ok := e.channels[name]
 		if !ok {
@@ -310,135 +139,36 @@ func (e *Engine) dispatch(channelNames []string, svc config.Service, p dispatchP
 			continue
 		}
 
-		switch strings.ToLower(strings.TrimSpace(ch.Type)) {
-		case "discord":
-			if err := e.sendDiscord(ch.WebhookURL, p.webhookMessage); err != nil {
-				e.log.Warn("discord send failed",
-					"channel", name,
-					"service_id", svc.ID,
-					"service_name", svc.Name,
-					"kind", p.kind,
-					"error", err.Error(),
-				)
-			} else {
-				e.log.Info("discord alert sent",
-					"channel", name,
-					"service_id", svc.ID,
-					"service_name", svc.Name,
-					"kind", p.kind,
-				)
-			}
-
-		case "slack":
-			if err := e.sendSlack(ch.WebhookURL, p.webhookMessage); err != nil {
-				e.log.Warn("slack send failed",
-					"channel", name,
-					"service_id", svc.ID,
-					"service_name", svc.Name,
-					"kind", p.kind,
-					"error", err.Error(),
-				)
-			} else {
-				e.log.Info("slack alert sent",
-					"channel", name,
-					"service_id", svc.ID,
-					"service_name", svc.Name,
-					"kind", p.kind,
-				)
-			}
-
-		case "email":
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-
-			// Redaction: do NOT log username/password.
-			authConfigured := strings.TrimSpace(ch.Username) != "" || strings.TrimSpace(ch.Password) != ""
-
-			subj := p.emailSubject
-			body := p.emailBody
-			if strings.TrimSpace(subj) == "" {
-				subj = fmt.Sprintf("[ALERT] %s (%s)", svc.Name, svc.ID)
-			}
-			if strings.TrimSpace(body) == "" {
-				body = p.webhookMessage
-			}
-
-			if err := e.sendEmail(ctx, ch, subj, body); err != nil {
-				e.log.Warn("email send failed",
-					"channel", name,
-					"smtp_host", ch.SMTPHost,
-					"smtp_port", ch.SMTPPort,
-					"auth", authConfigured,
-					"to_count", len(ch.To),
-					"service_id", svc.ID,
-					"service_name", svc.Name,
-					"kind", p.kind,
-					"error", err.Error(),
-				)
-			} else {
-				e.log.Info("email alert sent",
-					"channel", name,
-					"smtp_host", ch.SMTPHost,
-					"smtp_port", ch.SMTPPort,
-					"auth", authConfigured,
-					"to_count", len(ch.To),
-					"service_id", svc.ID,
-					"service_name", svc.Name,
-					"kind", p.kind,
-				)
-			}
-
-		default:
-			e.log.Warn("unsupported channel type (milestone 6 supports discord/slack/email)",
-				"channel", name,
-				"type", ch.Type,
-				"service_id", svc.ID,
-				"service_name", svc.Name,
-				"kind", p.kind,
-			)
-		}
+		result := e.sender.Send(ctx, ch, payload)
+		e.logSendResult(name, ch, svc, payload.Kind, result)
 	}
 }
 
-func (e *Engine) sendDiscord(webhookURL, msg string) error {
-	if strings.TrimSpace(webhookURL) == "" {
-		return errors.New("empty discord webhook_url")
-	}
-	payload := map[string]string{"content": msg}
-	return e.postJSON(webhookURL, payload)
-}
-
-func (e *Engine) sendSlack(webhookURL, msg string) error {
-	if strings.TrimSpace(webhookURL) == "" {
-		return errors.New("empty slack webhook_url")
-	}
-	payload := map[string]string{"text": msg}
-	return e.postJSON(webhookURL, payload)
-}
-
-func (e *Engine) postJSON(url string, payload any) error {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
+func (e *Engine) logSendResult(channelName string, ch config.Channel, svc config.Service, kind string, result SendResult) {
+	channelType := strings.ToLower(strings.TrimSpace(ch.Type))
+	baseFields := []any{
+		"channel", channelName,
+		"service_id", svc.ID,
+		"service_name", svc.Name,
+		"kind", kind,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+	// Add type-specific fields
+	switch channelType {
+	case "email":
+		authConfigured := strings.TrimSpace(ch.Username) != "" || strings.TrimSpace(ch.Password) != ""
+		baseFields = append(baseFields,
+			"smtp_host", ch.SMTPHost,
+			"smtp_port", ch.SMTPPort,
+			"auth", authConfigured,
+			"to_count", len(ch.To),
+		)
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return err
+	if result.Success {
+		e.log.Info(fmt.Sprintf("%s alert sent", channelType), baseFields...)
+	} else {
+		baseFields = append(baseFields, "error", result.Error.Error())
+		e.log.Warn(fmt.Sprintf("%s send failed", channelType), baseFields...)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("non-2xx status: %s", resp.Status)
-	}
-	return nil
 }

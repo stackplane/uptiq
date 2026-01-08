@@ -12,93 +12,141 @@ import (
 	"time"
 )
 
+// HTTP checker configuration constants.
+const (
+	httpDialTimeout     = 5 * time.Second
+	httpKeepAlive       = 30 * time.Second
+	httpIdleConnTimeout = 90 * time.Second
+	httpTLSTimeout      = 5 * time.Second
+	httpContinueTimeout = 1 * time.Second
+	httpMaxIdleConns    = 100
+	httpMaxResponseBody = 1024 * 1024 // 1 MiB
+	httpMinTLSVersion   = tls.VersionTLS12
+)
+
+// HTTPChecker performs HTTP/HTTPS connectivity checks.
 type HTTPChecker struct {
 	client *http.Client
 }
 
+// NewHTTPChecker creates a new HTTPChecker instance.
 func NewHTTPChecker() *HTTPChecker {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   httpDialTimeout,
+			KeepAlive: httpKeepAlive,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:          httpMaxIdleConns,
+		IdleConnTimeout:       httpIdleConnTimeout,
+		TLSHandshakeTimeout:   httpTLSTimeout,
+		ExpectContinueTimeout: httpContinueTimeout,
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
+			MinVersion: httpMinTLSVersion,
 		},
 	}
 
 	return &HTTPChecker{
-		client: &http.Client{
-			Transport: transport,
-		},
+		client: &http.Client{Transport: transport},
 	}
 }
 
-func (h *HTTPChecker) Check(ctx context.Context, svc config.Service) Result {
+func (c *HTTPChecker) Check(ctx context.Context, svc config.Service) Result {
 	start := time.Now()
 
-	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(svc.Method), svc.URL, nil)
+	req, err := c.buildRequest(ctx, svc)
 	if err != nil {
-		return Result{Success: false, Latency: time.Since(start), Error: fmt.Sprintf("build request: %v", err)}
+		return Result{
+			Success: false,
+			Latency: time.Since(start),
+			Error:   fmt.Sprintf("build request: %v", err),
+		}
 	}
 
-	for k, v := range svc.Headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := h.client.Do(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
-		return Result{Success: false, Latency: time.Since(start), Error: err.Error()}
+		return Result{
+			Success: false,
+			Latency: time.Since(start),
+			Error:   err.Error(),
+		}
 	}
 	defer resp.Body.Close()
+	return c.evaluateResponse(resp, svc, start)
+}
 
-	res := Result{
+func (c *HTTPChecker) buildRequest(ctx context.Context, svc config.Service) (*http.Request, error) {
+	method := strings.ToUpper(svc.Method)
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, svc.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range svc.Headers {
+		req.Header.Set(key, value)
+	}
+
+	return req, nil
+}
+
+func (c *HTTPChecker) evaluateResponse(resp *http.Response, svc config.Service, start time.Time) Result {
+	result := Result{
 		StatusCode: resp.StatusCode,
 		Latency:    time.Since(start),
 		Success:    true,
 	}
 
-	if len(svc.ExpectedStatus) > 0 {
-		allowed := false
-		for _, code := range svc.ExpectedStatus {
-			if resp.StatusCode == code {
-				allowed = true
-				break
+	if err := c.validateStatusCode(resp.StatusCode, svc.ExpectedStatus); err != nil {
+		result.Success = false
+		result.Error = err.Error()
+		return result
+	}
+
+	if err := c.validateBodyContent(resp.Body, svc.Contains); err != nil {
+		result.Success = false
+		result.Error = err.Error()
+		return result
+	}
+
+	return result
+}
+
+func (c *HTTPChecker) validateStatusCode(actual int, expected []int) error {
+	if len(expected) > 0 {
+		for _, code := range expected {
+			if actual == code {
+				return nil
 			}
 		}
-		if !allowed {
-			res.Success = false
-			res.Error = fmt.Sprintf("unexpected status %d", resp.StatusCode)
-			return res
-		}
-	} else {
-		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-			res.Success = false
-			res.Error = fmt.Sprintf("unexpected status %d", resp.StatusCode)
-			return res
-		}
+
+		return fmt.Errorf("unexpected status %d", actual)
 	}
 
-	if strings.TrimSpace(svc.Contains) != "" {
-		const maxBody = 1024 * 1024 // 1 MiB
-		b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-		if err != nil {
-			res.Success = false
-			res.Error = fmt.Sprintf("read body: %v", err)
-			return res
-		}
-		if !strings.Contains(string(b), svc.Contains) {
-			res.Success = false
-			res.Error = "response does not contain expected content"
-			return res
-		}
+	if actual < 200 || actual >= 400 {
+		return fmt.Errorf("unexpected status %d", actual)
 	}
 
-	return res
+	return nil
+}
+
+func (c *HTTPChecker) validateBodyContent(body io.Reader, expected string) error {
+	if strings.TrimSpace(expected) == "" {
+		return nil
+	}
+
+	content, err := io.ReadAll(io.LimitReader(body, httpMaxResponseBody))
+	if err != nil {
+		return fmt.Errorf("read body: %v", err)
+	}
+
+	if !strings.Contains(string(content), expected) {
+		return fmt.Errorf("response does not contain expected content")
+	}
+
+	return nil
 }

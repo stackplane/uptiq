@@ -1,0 +1,65 @@
+global:
+  scrape_bind: "0.0.0.0:8080"
+  log_level: "info"
+  default_timeout: "5s"
+  default_interval: "30s"
+  worker_count: 5
+  jitter: "200ms"
+
+services:
+  # Monitor your website
+  - id: "website"
+    name: "My Website"
+    type: "http"
+    url: "https://example.com"
+    interval: "30s"
+    timeout: "5s"
+
+  # Monitor your API
+  - id: "api"
+    name: "API Health"
+    type: "http"
+    url: "https://api.example.com/health"
+    interval: "15s"
+    timeout: "3s"
+    expected_status: [200]
+
+  # Monitor your database
+  - id: "database"
+    name: "PostgreSQL"
+    type: "tcp"
+    host: "localhost"
+    port: 5432
+    interval: "15s"
+    timeout: "3s"
+
+alerting:
+  channels:
+    # Option 1: Discord
+    discord:
+      type: "discord"
+      webhook_url: "${DISCORD_WEBHOOK_URL}"
+
+    # Option 2: Slack
+    # slack:
+    #   type: "slack"
+    #   webhook_url: "${SLACK_WEBHOOK_URL}"
+
+    # Option 3: Email
+    # email:
+    #   type: "email"
+    #   smtp_host: "smtp.gmail.com"
+    #   smtp_port: 587
+    #   username: "${SMTP_USER}"
+    #   password: "${SMTP_PASS}"
+    #   from: "Alerts <alerts@example.com>"
+    #   to: ["you@example.com"]
+
+  routes:
+    - match:
+        service_ids: ["website", "api", "database"]
+      policy:
+        failure_threshold: 3
+        cooldown: "10m"
+        recovery_alert: true
+      notify: ["discord"]

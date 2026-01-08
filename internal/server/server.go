@@ -1,9 +1,9 @@
+// Package server provides HTTP endpoints for health checks and metrics.
 package server
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -12,14 +12,22 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// ErrServerClosed is returned when the server is shut down.
 var ErrServerClosed = http.ErrServerClosed
 
+// Server configuration constants.
+const (
+	readHeaderTimeout = 5 * time.Second
+)
+
+// Server provides HTTP endpoints.
 type Server struct {
 	httpServer *http.Server
 	log        *slog.Logger
 }
 
-func NewServer(addr string, log *slog.Logger, reg *prometheus.Registry) *Server {
+// New creates a new server.
+func New(addr string, log *slog.Logger, reg *prometheus.Registry) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -28,38 +36,46 @@ func NewServer(addr string, log *slog.Logger, reg *prometheus.Registry) *Server 
 	}
 
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("ok\n"))
-	})
-
+	mux.HandleFunc("/healthz", healthHandler)
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 
-	s := &http.Server{
-		Addr:              addr,
-		Handler:           withRequestLogging(mux, log),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
 	return &Server{
-		httpServer: s,
-		log:        log,
+		httpServer: &http.Server{
+			Addr:              addr,
+			Handler:           withRequestLogging(mux, log),
+			ReadHeaderTimeout: readHeaderTimeout,
+		},
+		log: log,
 	}
 }
 
+// ListenAndServe starts the server.
 func (s *Server) ListenAndServe() error {
 	if s.httpServer == nil {
-		return errors.New("Server not initialized")
+		return errors.New("server not initialized")
 	}
 	return s.httpServer.ListenAndServe()
 }
 
+// Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.httpServer == nil {
 		return nil
 	}
 	return s.httpServer.Shutdown(ctx)
+}
+
+// Addr returns the server's address.
+func (s *Server) Addr() string {
+	if s.httpServer == nil {
+		return ""
+	}
+	return s.httpServer.Addr
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 func withRequestLogging(next http.Handler, log *slog.Logger) http.Handler {
@@ -73,11 +89,4 @@ func withRequestLogging(next http.Handler, log *slog.Logger) http.Handler {
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})
-}
-
-func (s *Server) String() string {
-	if s.httpServer == nil {
-		return "server(nil)"
-	}
-	return fmt.Sprintf("server(%s)", s.httpServer.Addr)
 }

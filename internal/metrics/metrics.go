@@ -1,44 +1,81 @@
+// Package metrics provides Prometheus metrics for monitoring.
 package metrics
 
 import (
-	"fmt"
 	"runtime"
-	"sitelert/internal/checks"
-	"sitelert/internal/config"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"sitelert/internal/checks"
+	"sitelert/internal/config"
 )
 
-type Metrics struct {
+// Labels used in metrics.
+const (
+	LabelServiceID   = "service_id"
+	LabelServiceName = "service_name"
+	LabelType        = "type"
+	LabelResult      = "result"
+)
+
+// Result label values.
+const (
+	ResultSuccess = "success"
+	ResultFailure = "failure"
+)
+
+// Collector contains all sitelert metrics.
+type Collector struct {
 	CheckTotal           *prometheus.CounterVec
 	CheckLatencySeconds  *prometheus.HistogramVec
 	Up                   *prometheus.GaugeVec
 	LastSuccessTimestamp *prometheus.GaugeVec
 	BuildInfo            *prometheus.GaugeVec
-
-	ConfigReloadSuccess prometheus.Gauge
+	ConfigReloadSuccess  prometheus.Gauge
 
 	mu          sync.Mutex
 	initialized map[string]struct{}
 }
 
+// Bundle combines a registry with its collector.
 type Bundle struct {
-	Registry *prometheus.Registry
-	Metrics  *Metrics
+	Registry  *prometheus.Registry
+	Collector *Collector
 }
 
+// NewBundle creates a new metrics bundle with all collectors registered.
 func NewBundle() *Bundle {
 	reg := prometheus.NewRegistry()
+	col := newCollector()
 
-	m := &Metrics{
+	reg.MustRegister(
+		col.CheckTotal,
+		col.CheckLatencySeconds,
+		col.Up,
+		col.LastSuccessTimestamp,
+		col.BuildInfo,
+		col.ConfigReloadSuccess,
+	)
+
+	// Set build info immediately
+	col.BuildInfo.WithLabelValues(runtime.Version(), runtime.GOOS, runtime.GOARCH).Set(1)
+	col.ConfigReloadSuccess.Set(1)
+
+	return &Bundle{Registry: reg, Collector: col}
+}
+
+func newCollector() *Collector {
+	serviceLabels := []string{LabelServiceID, LabelServiceName, LabelType}
+
+	return &Collector{
 		CheckTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "sitelert_check_total",
 				Help: "Total number of checks executed, labeled by result.",
 			},
-			[]string{"service_id", "service_name", "type", "result"},
+			append(serviceLabels, LabelResult),
 		),
 
 		CheckLatencySeconds: prometheus.NewHistogramVec(
@@ -47,7 +84,7 @@ func NewBundle() *Bundle {
 				Help:    "Check latency in seconds.",
 				Buckets: prometheus.DefBuckets,
 			},
-			[]string{"service_id", "service_name", "type"},
+			serviceLabels,
 		),
 
 		Up: prometheus.NewGaugeVec(
@@ -55,7 +92,7 @@ func NewBundle() *Bundle {
 				Name: "sitelert_up",
 				Help: "Whether the last check succeeded (1) or failed (0).",
 			},
-			[]string{"service_id", "service_name", "type"},
+			serviceLabels,
 		),
 
 		LastSuccessTimestamp: prometheus.NewGaugeVec(
@@ -63,7 +100,7 @@ func NewBundle() *Bundle {
 				Name: "sitelert_last_success_timestamp",
 				Help: "Unix timestamp of the last successful check.",
 			},
-			[]string{"service_id", "service_name", "type"},
+			serviceLabels,
 		),
 
 		BuildInfo: prometheus.NewGaugeVec(
@@ -83,88 +120,47 @@ func NewBundle() *Bundle {
 
 		initialized: make(map[string]struct{}),
 	}
-
-	// Register all collectors to this registry
-	reg.MustRegister(
-		m.CheckTotal,
-		m.CheckLatencySeconds,
-		m.Up,
-		m.LastSuccessTimestamp,
-		m.BuildInfo,
-		m.ConfigReloadSuccess,
-	)
-
-	// Set build info series (ensures /metrics isn't empty even before checks run)
-	m.BuildInfo.WithLabelValues(runtime.Version(), runtime.GOOS, runtime.GOARCH).Set(1)
-
-	m.ConfigReloadSuccess.Set(1)
-
-	return &Bundle{Registry: reg, Metrics: m}
 }
 
-// InitServices pre-creates time series so /metrics is immediately useful.
-// This also ensures "sitelert_up" exists for each service even before first run.
-func (m *Metrics) InitServices(services []config.Service) {
-	for _, s := range services {
-		typ := s.Type
-		labels := []string{s.ID, s.Name, typ}
+// EnsureServices pre-creates metric series for services without resetting existing ones.
+func (c *Collector) EnsureServices(services []config.Service) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-		// Create series with initial values
-		m.Up.WithLabelValues(labels...).Set(0)
-		m.LastSuccessTimestamp.WithLabelValues(labels...).Set(0)
-
-		// Create both counter series (success/failure) at 0
-		m.CheckTotal.WithLabelValues(s.ID, s.Name, typ, "success").Add(0)
-		m.CheckTotal.WithLabelValues(s.ID, s.Name, typ, "failure").Add(0)
-
-		// Create histogram series
-		_, _ = m.CheckLatencySeconds.GetMetricWithLabelValues(labels...)
-	}
-}
-
-// EnsureServices creates series for new services without resetting existing ones.
-func (m *Metrics) EnsureServices(services []config.Service) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, s := range services {
-		key := s.ID + "|" + s.Name + "|" + s.Type
-		if _, ok := m.initialized[key]; ok {
+	for _, svc := range services {
+		key := svc.ID + "|" + svc.Name + "|" + svc.Type
+		if _, exists := c.initialized[key]; exists {
 			continue
 		}
-		m.initialized[key] = struct{}{}
+		c.initialized[key] = struct{}{}
 
-		// Create series and set initial gauges for *new* services only.
-		m.Up.WithLabelValues(s.ID, s.Name, s.Type).Set(0)
-		m.LastSuccessTimestamp.WithLabelValues(s.ID, s.Name, s.Type).Set(0)
+		labels := []string{svc.ID, svc.Name, svc.Type}
 
-		// Touch counters/histograms without changing values
-		m.CheckTotal.WithLabelValues(s.ID, s.Name, s.Type, "success").Add(0)
-		m.CheckTotal.WithLabelValues(s.ID, s.Name, s.Type, "failure").Add(0)
-		_, _ = m.CheckLatencySeconds.GetMetricWithLabelValues(s.ID, s.Name, s.Type)
+		// Initialize gauges
+		c.Up.WithLabelValues(labels...).Set(0)
+		c.LastSuccessTimestamp.WithLabelValues(labels...).Set(0)
+
+		// Touch counters (initialize at 0)
+		c.CheckTotal.WithLabelValues(svc.ID, svc.Name, svc.Type, ResultSuccess).Add(0)
+		c.CheckTotal.WithLabelValues(svc.ID, svc.Name, svc.Type, ResultFailure).Add(0)
+
+		// Touch histogram
+		_, _ = c.CheckLatencySeconds.GetMetricWithLabelValues(labels...)
 	}
 }
 
-// Observe updates metrics for a check result.
-func (m *Metrics) Observe(svc config.Service, res checks.Result) {
-	typ := svc.Type
-	id := svc.ID
-	name := svc.Name
+// Observe records a check result in metrics.
+func (c *Collector) Observe(svc config.Service, res checks.Result) {
+	labels := []string{svc.ID, svc.Name, svc.Type}
 
-	m.CheckLatencySeconds.WithLabelValues(id, name, typ).Observe(res.Latency.Seconds())
+	c.CheckLatencySeconds.WithLabelValues(labels...).Observe(res.Latency.Seconds())
 
 	if res.Success {
-		m.CheckTotal.WithLabelValues(id, name, typ, "success").Inc()
-		m.Up.WithLabelValues(id, name, typ).Set(1)
-		m.LastSuccessTimestamp.WithLabelValues(id, name, typ).Set(float64(time.Now().Unix()))
-		return
+		c.CheckTotal.WithLabelValues(svc.ID, svc.Name, svc.Type, ResultSuccess).Inc()
+		c.Up.WithLabelValues(labels...).Set(1)
+		c.LastSuccessTimestamp.WithLabelValues(labels...).Set(float64(time.Now().Unix()))
+	} else {
+		c.CheckTotal.WithLabelValues(svc.ID, svc.Name, svc.Type, ResultFailure).Inc()
+		c.Up.WithLabelValues(labels...).Set(0)
 	}
-
-	m.CheckTotal.WithLabelValues(id, name, typ, "failure").Inc()
-	m.Up.WithLabelValues(id, name, typ).Set(0)
-}
-
-// Optional helper for debugging / future use
-func (m *Metrics) String() string {
-	return fmt.Sprintf("Metrics(check_total=%p)", m.CheckTotal)
 }
