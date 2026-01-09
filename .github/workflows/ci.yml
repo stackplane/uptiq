@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  # Define Strategy Matrix
+  _define:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ toJson(matrix) }}
+    strategy:
+      matrix: &go-matrix
+        go: ["1.24", "1.25"]
+        include:
+          - os: ubuntu-latest
+            go-build: ~/.cache/go-build
+          - os: macos-latest
+            go-build: ~/Library/Caches/go-build
+    steps:
+      - run: echo "Matrix defined"
+
+  # Check Job (Linting and Vetting)
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.25
+      - name: Setup golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.1.6
+          args: --verbose
+      - name: vet
+        run: go vet ./...
+
+  # Build Job
+  build:
+    needs: [_define, check]
+    strategy:
+      matrix: *go-matrix
+    name: Build Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    env:
+      GO111MODULE: "on"
+      GOPROXY: https://proxy.golang.org
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ${{ matrix.go-build }}
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.go }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.go }}-
+
+      - name: Build
+        run: go build ./...
+
+  # Test Job
+  test:
+    needs: [_define, build]
+    strategy:
+      matrix: *go-matrix
+    name: Test Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    env:
+      GO111MODULE: "on"
+      TESTTAGS: "-tags nomsgpack --ldflags='-checklinkname=0' -tags sonic -tags go_json -race"
+      GOPROXY: https://proxy.golang.org
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ${{ matrix.go-build }}
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.go }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.go }}-
+
+      - name: Run Tests
+        run: go test -v --cover ./... -coverprofile=coverage.out -covermode=count -json
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          flags: ubuntu-latest,go-${{ matrix.go }}
