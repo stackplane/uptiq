@@ -113,7 +113,11 @@ func sendSMTP(ctx context.Context, ch config.Channel, fromAddr string, toAddrs [
 	if err != nil {
 		return fmt.Errorf("smtp client: %w", err)
 	}
-	defer client.Close()
+	defer func() {
+		if cerr := client.Close(); err == nil && cerr != nil {
+			err = cerr
+		}
+	}()
 
 	isTLS := implicitTLS
 	if !implicitTLS {
@@ -157,7 +161,9 @@ func sendSMTP(ctx context.Context, ch config.Channel, fromAddr string, toAddrs [
 	}
 
 	if _, err := writer.Write(msg); err != nil {
-		writer.Close()
+		if cerr := writer.Close(); cerr != nil {
+			return fmt.Errorf("close writer", cerr)
+		}
 		return fmt.Errorf("write data: %w", err)
 	}
 

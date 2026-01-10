@@ -44,7 +44,7 @@ func Execute() {
 }
 
 func run(opts Options) error {
-	rand.Seed(time.Now().UnixNano())
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	log, err := NewLogger(opts.LogLevel)
 	if err != nil {
@@ -122,7 +122,11 @@ func (a *application) run() error {
 			return err
 		}
 		a.watcher = watcher
-		defer a.watcher.Close()
+		defer func() {
+			if err := a.watcher.Close(); err != nil {
+				a.log.Warn("config watcher close error", "error", err.Error())
+			}
+		}()
 		a.log.Info("config watch enabled", "path", a.opts.ConfigPath)
 	}
 

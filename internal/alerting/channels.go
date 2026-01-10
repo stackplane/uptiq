@@ -102,7 +102,11 @@ func (s *ChannelSender) postJSON(ctx context.Context, url string, payload any) e
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); err == nil && cerr != nil {
+			err = cerr
+		}
+	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("non-2xx status: %s", resp.Status)

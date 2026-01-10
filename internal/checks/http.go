@@ -72,7 +72,7 @@ func (c *HTTPChecker) Check(ctx context.Context, svc config.Service) Result {
 			Error:   err.Error(),
 		}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return c.evaluateResponse(resp, svc, start)
 }
 

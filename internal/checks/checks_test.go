@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"uptiq/internal/config"
 )
@@ -89,7 +90,14 @@ func TestFactory_Check_TCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start test server: %v", err)
 	}
-	defer listener.Close()
+	defer func() {
+		err := listener.Close()
+		if err != nil {
+			t.Fatalf("failed to close test server: %v", err)
+		}
+	}()
+
+	errCh := make(chan error, 1)
 
 	go func() {
 		for {
@@ -97,7 +105,17 @@ func TestFactory_Check_TCP(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			func() {
+				err := conn.Close()
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			}()
+
 		}
 	}()
 
@@ -114,6 +132,13 @@ func TestFactory_Check_TCP(t *testing.T) {
 
 	if !result.Success {
 		t.Errorf("expected success, got failure: %s", result.Error)
+	}
+
+	select {
+	case e := <-errCh:
+		t.Fatalf("failed to close connection: %v", e)
+	case <-time.After(200 * time.Millisecond):
+		// no error reported from goroutine within timeout
 	}
 }
 
@@ -209,7 +234,9 @@ func TestFactory_Integration(t *testing.T) {
 	// Test HTTP check
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
 	}))
 	defer httpServer.Close()
 
@@ -218,7 +245,11 @@ func TestFactory_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start TCP server: %v", err)
 	}
-	defer tcpListener.Close()
+	t.Cleanup(func() {
+		if err := tcpListener.Close(); err != nil {
+			t.Fatalf("close listener: %v", err)
+		}
+	})
 
 	go func() {
 		for {
@@ -226,7 +257,9 @@ func TestFactory_Integration(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			if err := conn.Close(); err != nil {
+				t.Fatalf("close conn: %v", err)
+			}
 		}
 	}()
 

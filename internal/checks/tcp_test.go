@@ -15,7 +15,11 @@ func TestTCPChecker_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start test server: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Fatalf("close listener: %v", err)
+		}
+	})
 
 	// Accept connections in background
 	go func() {
@@ -24,7 +28,9 @@ func TestTCPChecker_Success(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			if err := conn.Close(); err != nil {
+				t.Logf("close conn: %v", err)
+			}
 		}
 	}()
 
@@ -145,7 +151,9 @@ func TestTCPChecker_DifferentPorts(t *testing.T) {
 
 	defer func() {
 		for _, l := range listeners {
-			l.Close()
+			if err := l.Close(); err != nil {
+				t.Fatalf("close listener: %v", err)
+			}
 		}
 	}()
 
@@ -172,7 +180,11 @@ func TestTCPChecker_IPv6(t *testing.T) {
 	if err != nil {
 		t.Skip("IPv6 not available on this system")
 	}
-	defer listener.Close()
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Fatalf("close listener: %v", err)
+		}
+	})
 
 	// Accept connections
 	go func() {
