@@ -95,7 +95,7 @@ func sendSMTP(ctx context.Context, ch config.Channel, fromAddr string, toAddrs [
 	if err != nil {
 		return fmt.Errorf("dial smtp: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	implicitTLS := ch.SMTPPort == emailImplicitPort
 	if implicitTLS {

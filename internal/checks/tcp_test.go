@@ -193,7 +193,7 @@ func TestTCPChecker_IPv6(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -267,7 +267,7 @@ func TestTCPChecker_LatencyMeasurement(t *testing.T) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
