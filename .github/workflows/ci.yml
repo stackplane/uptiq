@@ -22,8 +22,11 @@ jobs:
         include:
           - os: ubuntu-latest
             go-build: ~/.cache/go-build
+
           - os: macos-latest
             go-build: ~/Library/Caches/go-build
+          - os: windows-latest
+            go-build: ~\AppData\Local\go-build
     steps:
       - run: echo "Matrix defined"
 
